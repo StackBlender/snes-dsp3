@@ -1,0 +1,7 @@
+build/
+local/
+*.rom
+*.bin
+*.sfc
+*.smc
+*.zip
