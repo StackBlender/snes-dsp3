@@ -4,6 +4,9 @@
 
 #include "dsp3/Decoder.h"
 
+#include <map>
+#include <queue>
+
 namespace dsp3 {
 
 void Dsp3::reset() {
@@ -24,13 +27,19 @@ void Dsp3::reset() {
 // Bit 7: ready (always). Bit 2: the next transfer is a byte (a command, or 8-bit data). Bit 6:
 // command 38 wants its next word (after its two counts), as its program signals it.
 uint8_t Dsp3::readStatus() const {
-	bool byte = !m_inCommand || (m_wantsInput && m_wantsByte);
-	bool signal = m_inCommand && m_command == 0x38 && m_wantsInput && m_in.size() >= 2;
+	bool byte = !m_inCommand || (m_wantsInput ? m_wantsByte : m_pendingByte);
+	bool signal = m_inCommand && m_wantsInput && m_signal;
 	return uint8_t(0x80 | (byte ? 0x04 : 0x00) | (signal ? 0x40 : 0x00));
 }
 
 uint8_t Dsp3::readData() {
 	if(!m_inCommand) return uint8_t(m_highByte ? m_data >> 8 : m_data);
+	if(!m_wantsInput && m_pendingByte) {  // a one-byte output
+		uint8_t value = uint8_t(m_pending);
+		m_data = uint16_t((m_data & 0xff00) | value);
+		wordOut();
+		return value;
+	}
 	if(!m_highByte) {
 		m_highByte = true;
 		return uint8_t((m_wantsInput ? m_data : m_pending) & 0xff);
@@ -78,38 +87,75 @@ void Dsp3::writeData(uint8_t value) {
 
 void Dsp3::wordIn(uint16_t word) {
 	m_in.push_back(word);
+	if(m_command == 0x38) {  // fed straight in: no replay
+		std::vector<uint16_t> out;
+		bool more = m_decoder.feed(word, out);
+		for(auto w : out) m_queue.push_back({w, false});
+		m_finished = !more;
+		m_stopByte = false;
+		m_stopSignal = m_in.size() >= 2;
+		settle();
+		return;
+	}
 	run();
 }
 
 void Dsp3::wordOut() {
 	m_outRead++;
-	run();
+	m_queueAt++;
+	settle();
 }
 
 uint16_t Dsp3::need() {
 	if(m_inAt < m_in.size()) return m_in[m_inAt++];
-	m_wantsInput = true;
-	m_wantsByte = false;
+	m_stopByte = false;
+	m_stopSignal = (m_command == 0x38 && m_inAt >= 2) || (m_command == 0x1e && m_inAt >= 1);
 	throw Stop{};
 }
 
 uint8_t Dsp3::needByte() {
 	if(m_inAt < m_in.size()) return uint8_t(m_in[m_inAt++]);
-	m_wantsInput = true;
-	m_wantsByte = true;
+	m_stopByte = true;
+	m_stopSignal = false;
 	throw Stop{};
+}
+
+// After a run or a read: the next queued output, else the input the command waits for, else idle
+void Dsp3::settle() {
+	if(m_queueAt < m_queue.size()) {
+		m_wantsInput = false;
+		m_pending = m_queue[m_queueAt].first;
+		m_pendingByte = m_queue[m_queueAt].second;
+		return;
+	}
+	if(m_finished) {
+		m_inCommand = false;
+		m_wantsInput = false;
+		m_data = 0x8080;
+		return;
+	}
+	m_wantsInput = true;
+	m_wantsByte = m_stopByte;
+	m_signal = m_stopSignal;
 }
 
 void Dsp3::give(uint16_t word) {
 	if(m_outAt++ < m_outRead) return;  // already read
-	m_wantsInput = false;
-	m_pending = word;
-	throw Stop{};
+	m_queue.push_back({word, false});
 }
 
-// Runs the command from its start over the words it has, up to the next word it needs or gives.
+void Dsp3::giveByte(uint8_t value) {
+	if(m_outAt++ < m_outRead) return;
+	m_queue.push_back({value, true});
+}
+
+// Runs the command from its start over the inputs it has, up to the next input it needs, queueing
+// the outputs not yet read.
 void Dsp3::run() {
 	m_inAt = m_outAt = 0;
+	m_queue.clear();
+	m_queueAt = 0;
+	m_finished = false;
 	uint16_t board = m_boardRun, start = m_startRun;
 	try {
 		switch(m_command) {
@@ -180,13 +226,89 @@ void Dsp3::run() {
 			need();
 			for(int i = 0; i < 1024; i++) give(0x0000);
 			break;
+		case 0x1e: {  // movement costs from the start cell (3E) over a hex area of a given range
+			// Phase 1: the range (high byte); then each cell of the area (offset), answered with two
+			// bytes (a flag, and the cost of entering it; FFh: it can't be entered). Then FFFFh.
+			// Phase 2: the range again; then each cell (offset) and its cost from the start (a byte,
+			// 255 if it can't be reached). The cells come by sector (the six directions), each by
+			// ring 1 to the range, k cells in ring k.
+			int range = need() >> 8;
+			int rows = board >> 8, cols = board & 0xff;
+			auto step = [&](int& row, int& col, int direction) {
+				static const int even[6][2] = {{-1, 0}, {-1, 1}, {0, 1}, {1, 0}, {0, -1}, {-1, -1}};
+				static const int odd[6][2] = {{-1, 0}, {0, 1}, {1, 1}, {1, 0}, {1, -1}, {0, -1}};
+				const int* move = col % 2 ? odd[direction % 6] : even[direction % 6];
+				row = rows ? (row + move[0] + rows) % rows : row + move[0];
+				col = cols ? (col + move[1] + cols) % cols : col + move[1];
+			};
+			std::vector<std::pair<int, int>> area;
+			for(int sector = 0; sector < 6; sector++) {
+				for(int k = 1; k <= range; k++) {
+					int row = start >> 8, col = start & 0xff;
+					for(int i = 0; i < k; i++) step(row, col, sector);
+					for(int j = 0; j < k; j++) area.push_back({row, col}), step(row, col, sector + 2);
+				}
+			}
+			std::vector<uint8_t> enter(area.size());
+			for(size_t i = 0; i < area.size(); i++) {
+				give(uint16_t(area[i].first * cols + area[i].second));
+				needByte();
+				enter[i] = needByte();
+			}
+			give(0xffff);
+			need();
+			// The shortest costs over the area (the original's own search differs in a few cells:
+			// docs/exactness.md)
+			std::map<std::pair<int, int>, size_t> at;
+			for(size_t i = 0; i < area.size(); i++) at[area[i]] = i;
+			std::vector<int> cost(area.size(), 1 << 30);
+			std::priority_queue<std::pair<int, std::pair<int, int>>, std::vector<std::pair<int, std::pair<int, int>>>, std::greater<>> queue;
+			std::pair<int, int> origin{start >> 8, start & 0xff};
+			queue.push({0, origin});
+			std::map<std::pair<int, int>, int> best{{origin, 0}};
+			while(!queue.empty()) {
+				auto [d, cell] = queue.top();
+				queue.pop();
+				if(d > best[cell]) continue;
+				for(int direction = 0; direction < 6; direction++) {
+					int row = cell.first, col = cell.second;
+					step(row, col, direction);
+					auto found = at.find({row, col});
+					if(found == at.end() || enter[found->second] == 0xff) continue;
+					int nd = d + enter[found->second];
+					if(nd < cost[found->second]) {
+						cost[found->second] = nd;
+						best[{row, col}] = nd;
+						queue.push({nd, {row, col}});
+					}
+				}
+			}
+			for(size_t i = 0; i < area.size(); i++) {
+				give(uint16_t(area[i].first * cols + area[i].second));
+				giveByte(uint8_t(cost[i] > 255 ? 255 : cost[i]));
+			}
+			give(0xffff);
+			break;
+		}
 		case 0x2f:  // program version
 			need();
 			give(0x0300);
 			break;
-		case 0x38: {  // decode a Shannon-Fano coded stream
-			Decoder decoder([&] { return need(); }, [&](uint16_t w) { give(w); });
-			decoder.run();
+		case 0x38: {  // decode a coded stream: the Decoder, fed the words so far (wordIn() feeds
+			// it directly while the command runs; this replays them, from the start or a load)
+			m_decoder = Decoder();
+			std::vector<uint16_t> out;
+			bool more = true;
+			for(auto w : m_in) {
+				more = m_decoder.feed(w, out);
+				if(!more) break;
+			}
+			for(auto w : out) give(w);
+			if(more) {
+				m_stopByte = false;
+				m_stopSignal = m_in.size() >= 2;
+				throw Stop{};
+			}
 			break;
 		}
 		case 0x3e: {  // the start cell for 1E, and its offset
@@ -198,10 +320,10 @@ void Dsp3::run() {
 		default:
 			break;
 		}
-		m_inCommand = false;
-		m_data = 0x8080;
+		m_finished = true;
 	} catch(Stop&) {
 	}
+	settle();
 }
 
 std::vector<uint8_t> Dsp3::saveState() const {

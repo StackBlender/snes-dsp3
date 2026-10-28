@@ -16,6 +16,8 @@
 #include <deque>
 #include <vector>
 
+#include "dsp3/Decoder.h"
+
 namespace dsp3 {
 
 class Dsp3 {
@@ -31,17 +33,20 @@ public:
 	bool loadState(const uint8_t* data, size_t size);
 
 private:
-	// A command is a little program: it takes words with need(), gives them with give(). Run
-	// from the start each time a word arrives, over the words so far (they are kept), so the
-	// state to save is just the command, its words and how many outputs were read.
+	// A command is a little program: it takes words with need(), gives them with give(). It is
+	// run from the start each time an input arrives, over the inputs so far (they are kept), up
+	// to the next input it needs, its outputs from there on queued. So the state to save is just
+	// the command, its inputs and how many outputs were read.
 	struct Stop {};
 	uint16_t need();
 	uint8_t needByte();  // an input transferred as one byte (the chip's 8-bit mode)
 	void give(uint16_t word);
+	void giveByte(uint8_t value);  // an output transferred as one byte
 	void run();
 
 	void wordIn(uint16_t word);
 	void wordOut();
+	void settle();
 
 	uint8_t m_command = 0;
 	bool m_inCommand = false;  // a command is running (else the next byte is a command)
@@ -52,6 +57,12 @@ private:
 	bool m_wantsInput = false; // the command waits for an input word (else it has an output)
 	bool m_wantsByte = false;  // ... an input byte (8-bit mode)
 	uint16_t m_pending = 0;    // the output waiting to be read
+	bool m_pendingByte = false;  // ... as one byte
+	std::vector<std::pair<uint16_t, bool>> m_queue;  // outputs not yet read (word, as a byte)
+	size_t m_queueAt = 0;
+	bool m_stopByte = false, m_stopSignal = false;  // how the last run's need() asked
+	Decoder m_decoder;  // command 38's, fed as words arrive (replayed from m_in after a load)
+	bool m_signal = false;     // status bit 6: the command signals that it wants a word
 	bool m_finished = false;
 	bool m_highByte = false;
 	uint8_t m_lowByte = 0;

@@ -5,7 +5,8 @@
 // chip's 8-bit mode), "W XXXX" (a word written), "r XX" (a byte read), "R XXXX" (a word read);
 // other lines are ignored. Recordings come from the original
 // chip (docs/clean-room.md) and stay out of this repository.
-//   dsp3_check RECORDING...
+// With -s, the chip's state is saved and loaded again after every transfer.
+//   dsp3_check [-s] RECORDING...
 #include "dsp3/Dsp3.h"
 
 #include <cstdio>
@@ -13,9 +14,10 @@
 #include <string>
 
 int main(int argc, char** argv) {
-	if(argc < 2) return std::fprintf(stderr, "usage: dsp3_check RECORDING...\n"), 2;
+	bool states = argc > 1 && std::string(argv[1]) == "-s";
+	if(argc < 2 + states) return std::fprintf(stderr, "usage: dsp3_check [-s] RECORDING...\n"), 2;
 	int failed = 0;
-	for(int f = 1; f < argc; f++) {
+	for(int f = 1 + states; f < argc; f++) {
 		std::ifstream in(argv[f]);
 		dsp3::Dsp3 chip;
 		std::string kind, value;
@@ -24,6 +26,12 @@ int main(int argc, char** argv) {
 			if(kind != "w" && kind != "W" && kind != "R" && kind != "r") { std::getline(in, value); continue; }
 			in >> value;
 			line++;
+			if(states) {
+				auto state = chip.saveState();
+				dsp3::Dsp3 fresh;
+				if(!fresh.loadState(state.data(), state.size())) return std::fprintf(stderr, "a state didn't load\n"), 1;
+				chip = fresh;
+			}
 			unsigned v = unsigned(std::stoul(value, nullptr, 16));
 			if(kind == "w") { chip.writeData(uint8_t(v)); continue; }
 			if(kind == "W") { chip.writeData(uint8_t(v)); chip.writeData(uint8_t(v >> 8)); continue; }

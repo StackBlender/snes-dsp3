@@ -10,3 +10,8 @@ target_include_directories(dsp3 PUBLIC src)
 
 add_executable(dsp3_check tools/dsp3_check.cpp)
 target_link_libraries(dsp3_check PRIVATE dsp3)
+
+enable_testing()
+add_executable(dsp3_state_test tests/state_test.cpp)
+target_link_libraries(dsp3_state_test PRIVATE dsp3)
+add_test(NAME dsp3_state COMMAND dsp3_state_test)
